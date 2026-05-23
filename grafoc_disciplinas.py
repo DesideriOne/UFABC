@@ -36,9 +36,14 @@ df["RECOMENDACAO_LIMPA"] = (
     df["RECOMENDAÇÃO"].fillna("").str.replace(r"[\n\r]", " ", regex=True)
 )
 
+df2 = pd.read_excel(r"C:\Users\Rennan Desideri\Documents\matriculas_2026_2_turmas_ofertadas.xlsx")
+quad_atual = "2026.2"
+df2["SIGLA_BASE"] = df2["turma"].apply(lambda x: re.sub(r"-\d{2}$", "", str(x)))
+df_grouped = df2.groupby(["SIGLA_BASE","CURSO"]).agg({"turma": "count","CAMPUS": "nunique"}).rename(columns={"turma": "QUANTIDADE"}).reset_index()
+
 # Mapa nome_disciplina (maiúsculo) -> sigla  (para resolver recomendações)
 NOME_PARA_SIGLA: dict[str, str] = {
-    row["DISCIPLINA"].upper(): row["SIGLA_BASE"] for _, row in df.iterrows()
+    row["DISCIPLINA"].upper(): row["SIGLA"] for _, row in df.iterrows()
 }
 THEMES = json.load(open("themes.json", "r", encoding="utf-8"))
 _CSS = open("layout.css", "r", encoding="utf-8").read()
@@ -321,6 +326,7 @@ def siglas_aprovadas(course_history: dict) -> set[str]:
 def criar_grafo_completo(df_catalogo: pd.DataFrame):
     """Cria dígrafo com todas as disciplinas e suas recomendações."""
     G = nx.DiGraph()
+    # Usamos o dicionário global NOME_PARA_SIGLA que você já definiu no topo do arquivo
     codigo_para_nome = dict(zip(df_catalogo["SIGLA"], df_catalogo["DISCIPLINA"]))
  
     for codigo, nome in codigo_para_nome.items():
@@ -328,15 +334,27 @@ def criar_grafo_completo(df_catalogo: pd.DataFrame):
  
     for _, row in df_catalogo.iterrows():
         origem = row["SIGLA"]
+        # RECOMENDACAO_LIMPA contém os nomes das disciplinas separados por ';'
         for item in row["RECOMENDACAO_LIMPA"].split(";"):
-            item_limpo = item.strip()
-            if not item_limpo or item_limpo.lower() in ("não há", "nao ha", ""):
+            item_limpo = item.strip().upper()
+            if not item_limpo or item_limpo in ("NÃO HÁ", "NAO HA", ""):
                 continue
-            # Busca por nome exato (case-insensitive)
-            item_upper = item_limpo.upper()
-            for cod, nome in codigo_para_nome.items():
-                if item_upper in nome.upper() and cod != origem:
-                    G.add_edge(cod, origem)
+            
+            # Tenta encontrar a sigla exata através do nome da disciplina
+            sigla_recomendada = NOME_PARA_SIGLA.get(item_limpo)
+            
+            if not sigla_recomendada:
+                for nome_catalogo, sigla_catalogo in NOME_PARA_SIGLA.items():
+                    # Verifica se o nome listado na recomendação é parte de um nome real
+                    # ou vice-versa (ex: "Cálculo I" vs "Cálculo Diferencial e Integral I")
+                    if item_limpo in nome_catalogo or nome_catalogo in item_limpo:
+                        sigla_recomendada = sigla_catalogo
+                        break
+            
+            if sigla_recomendada and sigla_recomendada in G.nodes:
+                # Adiciona a aresta da recomendada para a origem (pré-requisito)
+                G.add_edge(sigla_recomendada, origem)
+                
     return G, codigo_para_nome
  
  
@@ -469,35 +487,44 @@ def gerar_subgrafo(G: nx.DiGraph, sigla: str, course_history: dict | None,
 # ENGINE DE SUGESTÃO DE MATÉRIAS
 # ==============================================================================
 
-def calcular_sugestoes(course_history: dict, df_catalogo: pd.DataFrame, top_n: int = 20) -> list[dict]:
-    """
-    Pontua cada disciplina ainda não aprovada e retorna as mais recomendadas.
-
-    Critérios:
-    - recomendacoes_cumpridas: fração das disciplinas recomendadas já aprovadas
-    - penalidade_reprovacoes: penaliza cada reprovação prévia na disciplina
-    - bonus_sem_historico: disciplinas sem nenhuma tentativa partem de zero (neutro)
-
-    Score = recomendacoes_cumpridas * 10  (0–10)
-            - penalidade_reprovacoes       (0 a -∞, mas limitado)
-    Quanto maior, mais sugerida.
-    """
+# ==============================================================================
+# ENGINE DE SUGESTÃO DE MATÉRIAS
+# ==============================================================================
+def calcular_sugestoes(course_history: dict, df_catalogo: pd.DataFrame, df_ofertadas: pd.DataFrame, 
+                       curso_filtro: str = None, somente_quad_atual: bool = False, top_n: int = 30) -> list[dict]:
+    
     aprovadas = siglas_aprovadas(course_history)
     hist_expandido = historico_para_sigla_base(course_history)
 
-    # Mapa nome -> sigla para resolver recomendações
     nome_upper_para_sigla = {
         row["DISCIPLINA"].upper(): row["SIGLA"]
         for _, row in df_catalogo.iterrows()
     }
 
+    # Transforma o df agrupado num dicionário rápido de consulta
+    ofertadas_dict = {
+        row["SIGLA_BASE"]: {"QUANTIDADE": row["QUANTIDADE"], "CAMPUS": row["CAMPUS"]}
+        for _, row in df_ofertadas.iterrows()
+    }
+
     resultados = []
 
-    for _, row in df_catalogo.iterrows():
+    # Aplica o filtro de curso no catálogo, se houver
+    df_filtrado = df_catalogo
+    if curso_filtro:
+        df_filtrado = df_filtrado[df_filtrado["NOME_CURSO"] == curso_filtro]
+
+    for _, row in df_filtrado.iterrows():
         sigla = row["SIGLA"]
         base = re.sub(r"-\d{2}$", "", sigla)
 
-        # Pula disciplinas já aprovadas
+        # Verifica oferta no quadrimestre atual
+        oferta_info = ofertadas_dict.get(base, {"QUANTIDADE": 0, "CAMPUS": 0})
+        
+        # Se o filtro estiver ativo e a matéria não tiver turmas, pula
+        if somente_quad_atual and oferta_info["QUANTIDADE"] == 0:
+            continue
+
         if sigla in aprovadas or base in aprovadas:
             continue
 
@@ -522,27 +549,21 @@ def calcular_sugestoes(course_history: dict, df_catalogo: pd.DataFrame, top_n: i
                     recs_cumpridas += 1
                     tentativas_rec = hist_expandido.get(sigla_rec) or hist_expandido.get(base_rec) or []
                     reprovacoes_rec = sum(1 for t in tentativas_rec if t["situacao"] not in STATUS_APROVACAO)
-                    # Subtrai 1.0 ponto para cada reprovação em cada matéria recomendada
                     penalidade_recs_reprovadas += (reprovacoes_rec * 1.0)
             frac_recs = recs_cumpridas / total_recs
         else:
-            # Sem recomendações formais: disciplina livre.
-            # Pontuamos como 0.5 (neutro) para não inflar o ranking acima
-            # de disciplinas com recomendações reais já cumpridas.
             frac_recs = 0.5
             recs_cumpridas = 0
 
-        # --- Histórico do aluno nesta disciplina ---
+        # --- Histórico ---
         tentativas_prev = hist_expandido.get(sigla) or hist_expandido.get(base) or []
-        reprovacoes_prev = sum(
-            1 for t in tentativas_prev if t["situacao"] not in STATUS_APROVACAO
-        )
-
-        # Penalidade por reprovações: cada reprovação subtrai 1.5 pontos (máx -6)
+        reprovacoes_prev = sum(1 for t in tentativas_prev if t["situacao"] not in STATUS_APROVACAO)
         penalidade = min(reprovacoes_prev * 1.5, 6.0)
 
-        # Score final
         score = frac_recs * 10 - penalidade - penalidade_recs_reprovadas
+        
+        _list = str(row.get("TPEI", "0-0-0-0")).split("-")
+        t_val, p_val, e_val, i_val = _list[0], _list[1], _list[2], _list[3] if len(_list) == 4 else 0
 
         resultados.append({
             "SIGLA": sigla,
@@ -553,11 +574,13 @@ def calcular_sugestoes(course_history: dict, df_catalogo: pd.DataFrame, top_n: i
             "PENALIDADE_RECS": round(penalidade_recs_reprovadas, 1),
             "TENTATIVAS_PREV": len(tentativas_prev),
             "REPROVACOES_PREV": reprovacoes_prev,
+            "TURMAS": oferta_info["QUANTIDADE"],
+            "CAMPI": oferta_info["CAMPUS"],
+            "T": t_val, "P": p_val, "E": e_val, "I": i_val
         })
 
     resultados.sort(key=lambda x: x["SCORE"], reverse=True)
     return resultados[:top_n]
-
 
 # ==============================================================================
 # APLICAÇÃO DASH
@@ -1004,14 +1027,45 @@ def _stat_card(label, value, color, t):
 # ==============================================================================
 # PÁGINA: SUGESTÕES  (/sugestoes)
 # ==============================================================================
+# ==============================================================================
+# PÁGINA: SUGESTÕES  (/sugestoes)
+# ==============================================================================
 def create_layout_sugestoes():
+    # Pega todos os cursos únicos disponíveis no catálogo para o filtro
+    cursos_disponiveis = sorted(df["NOME_CURSO"].dropna().unique())
+    
     return html.Div([
         html.H2("💡 Sugestões de Matérias"),
         html.P(
             "Ranqueamento das disciplinas ainda não aprovadas, considerando: "
             "proporção de recomendações já cumpridas, histórico de reprovações "
-            "e disponibilidade de pré-requisitos.",
+            "e disponibilidade de pré-requisitos."
         ),
+        
+        # --- NOVOS FILTROS ---
+        html.Div([
+            html.Div([
+                html.Label("Filtrar por Curso:"),
+                dcc.Dropdown(
+                    id="filtro-curso",
+                    options=[{"label": c, "value": c} for c in cursos_disponiveis],
+                    placeholder="Todos os cursos",
+                    clearable=True,
+                    style={"fontSize": "0.88rem", "marginTop": "4px"}
+                ),
+            ], style={"flex": "2", "minWidth": "250px"}),
+            
+            html.Div([
+                html.Label("Disponibilidade:"),
+                dcc.Checklist(
+                    id="filtro-quad-atual",
+                    options=[{"label": f" Somente turmas ofertadas em {quad_atual}", "value": "SIM"}],
+                    value=[], # Vazio por padrão
+                    style={"marginTop": "10px", "fontWeight": "600"}
+                )
+            ], style={"flex": "1", "minWidth": "250px"}),
+        ], style={"display": "flex", "gap": "20px", "marginBottom": "20px", "flexWrap": "wrap", "alignItems": "center"}),
+        
         html.Div(id="sugestoes-content"),
     ])
  
@@ -1019,9 +1073,11 @@ def create_layout_sugestoes():
 @app.callback(
     Output("sugestoes-content", "children"),
     Input("historico-data-store", "data"),
+    Input("filtro-curso", "value"),          # NOVO INPUT
+    Input("filtro-quad-atual", "value"),     # NOVO INPUT
     State("theme-store", "data"),
 )
-def atualizar_sugestoes(course_history, theme):
+def atualizar_sugestoes(course_history, curso_selecionado, quad_atual_selecionado, theme):
     t = THEMES.get(theme or _DEFAULT_THEME, THEMES[_DEFAULT_THEME])
  
     if not course_history:
@@ -1035,13 +1091,24 @@ def atualizar_sugestoes(course_history, theme):
             ], className="panel", style={"borderLeft": f"4px solid {t['warning']}"}),
         ])
  
-    sugestoes = calcular_sugestoes(course_history, df, top_n=30)
+    # Determina se a checkbox foi marcada
+    somente_quad_atual = bool(quad_atual_selecionado and "SIM" in quad_atual_selecionado)
+
+    # Chama a engine atualizada
+    sugestoes = calcular_sugestoes(
+        course_history=course_history, 
+        df_catalogo=df, 
+        df_ofertadas=df_grouped, 
+        curso_filtro=curso_selecionado, 
+        somente_quad_atual=somente_quad_atual,
+        top_n=40
+    )
  
     if not sugestoes:
-        return html.Div("🎉 Parabéns! Nenhuma disciplina pendente encontrada no catálogo.",
+        return html.Div("Nenhuma disciplina pendente encontrada com os filtros atuais.",
                         className="panel",
-                        style={"color": t["accent"], "fontWeight": "600",
-                               "borderLeft": f"4px solid {t['accent']}"})
+                        style={"color": t["warning"], "fontWeight": "600",
+                               "borderLeft": f"4px solid {t['warning']}"})
  
     ts = _table_styles(t)
  
@@ -1054,13 +1121,15 @@ def atualizar_sugestoes(course_history, theme):
          "backgroundColor": t["danger_bg"], "color": t["danger"]},
         {"if": {"filter_query": "{REPROVACOES_PREV} > 0", "column_id": "REPROVACOES_PREV"},
          "color": t["danger"], "fontWeight": "bold"},
-        {"if": {"filter_query": "{REPROVACOES_RECS} > 0", "column_id": "REPROVACOES_RECS"},
+        # Destaca turmas zeradas caso a pessoa não use o filtro
+        {"if": {"filter_query": "{TURMAS} = 0", "column_id": "TURMAS"},
          "color": t["danger"], "fontWeight": "bold"},
+        {"if": {"filter_query": "{TURMAS} > 0", "column_id": "TURMAS"},
+         "color": t["accent"], "fontWeight": "bold"},
     ]
  
     return html.Div([
-        html.H4(f"Top {len(sugestoes)} disciplinas recomendadas",
-                style={"marginBottom": "10px"}),
+        html.H4(f"Top {len(sugestoes)} disciplinas recomendadas", style={"marginBottom": "10px"}),
  
         html.Div(className="panel", style={"marginBottom": "16px", "fontSize": "0.85rem"}, children=[
             html.Div([
@@ -1078,14 +1147,17 @@ def atualizar_sugestoes(course_history, theme):
         dash_table.DataTable(
             data=sugestoes,
             columns=[
-                {"name": "Sigla",                "id": "SIGLA"},
-                {"name": "Disciplina",            "id": "DISCIPLINA"},
-                {"name": "Score",                 "id": "SCORE"},
-                {"name": "Recs. Cumpridas",       "id": "RECS_CUMPRIDAS"},
-                {"name": "% Recs.",               "id": "FRAC_RECS_%"},
-                {"name": "Tentativas Anteriores", "id": "TENTATIVAS_PREV"},
-                {"name": "Reprovações Anteriores","id": "REPROVACOES_PREV"},
-                {"name": "Reprovações em Recomendações", "id": "REPROVACOES_RECS"},
+                {"name": "Sigla",                  "id": "SIGLA"},
+                {"name": "Disciplina",             "id": "DISCIPLINA"},
+                {"name": "Turmas",                 "id": "TURMAS"},      # NOVA COLUNA
+                {"name": "Campi",                  "id": "CAMPI"},       # NOVA COLUNA
+                {"name": "Score",                  "id": "SCORE"},
+                {"name": "Recs. Cumpridas",        "id": "RECS_CUMPRIDAS"},
+                {"name": "% Recs.",                "id": "FRAC_RECS_%"},
+                {"name": "Tentativas Anteriores",  "id": "TENTATIVAS_PREV"},
+                {"name": "Reprovações Anteriores", "id": "REPROVACOES_PREV"},
+                {"name": "T", "id": "T"}, {"name": "P", "id": "P"}, 
+                {"name": "E", "id": "E"}, {"name": "I", "id": "I"},
             ],
             style_data_conditional=cond,
             style_table=ts["style_table"],
@@ -1096,8 +1168,7 @@ def atualizar_sugestoes(course_history, theme):
             filter_action="native",
         ),
     ])
- 
- 
+
 def _score_badge(label, bg, fg, tooltip):
     return html.Span([
         html.Span(label, style={
